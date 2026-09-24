@@ -1,0 +1,144 @@
+### 0a. API Gateway Health Check
+GET http://localhost:8000/health
+
+### 0b. Phrase Service Health Check
+GET http://localhost:8002/health
+
+### 0c. Sentiment Service Health Check
+GET http://localhost:8003/health
+
+### 0d. Score Service Health Check
+GET http://localhost:8004/health
+
+### 1a. Process Direct Text Message
+POST http://localhost:8000/api/v1/process-text
+Content-Type: application/json
+
+{
+  "text": "I am extremely hello unhappy and I want to cancel my account immediately."
+}
+
+### 1b. Process Direct Text Message (Agent Response)
+POST http://localhost:8000/api/v1/process-text
+Content-Type: application/json
+
+{
+  "text": "I completely understand your concern and I am happy to help resolve this for you right away.",
+  "speaker": "agent"
+}
+
+### 1c. Process Message with Previous Score
+POST http://localhost:8000/api/v1/process-text
+Content-Type: application/json
+
+{
+  "text": "I am extremely angry and furious about this issue!",
+  "speaker": "caller",
+  "previous_score": -60.0
+}
+
+### 2a. Add Single Monitored Keyword with Category via API Gateway (PostgreSQL)
+POST http://localhost:8000/api/v1/add-keyword
+Content-Type: application/json
+
+{
+  "keyword": "cancel account",
+  "category": "churn"
+}
+
+### 2b. Add Single Monitored Keyword without Category (Defaults to NULL)
+POST http://localhost:8000/api/v1/add-keyword
+Content-Type: application/json
+
+{
+  "keyword": "Bad"
+}
+
+### 2c. Add Multiple Monitored Keywords with Specific Categories in Batch
+POST http://localhost:8000/api/v1/add-keyword
+Content-Type: application/json
+
+{
+  "keywords": [
+    { "keyword": "refund", "category": "billing" },
+    { "keyword": "billing dispute", "category": "billing" },
+    { "keyword": "lawyer", "category": "compliance" },
+    { "keyword": "talk to supervisor" }
+  ]
+}
+
+### 2d. Add Multiple Monitored Keywords with Common Category
+POST http://localhost:8000/api/v1/add-keyword
+Content-Type: application/json
+
+{
+  "category": "satisfaction",
+  "keywords": [
+    "great job",
+    "thank you",
+    "excellent service"
+  ]
+}
+
+### 2e. Get All Monitored Keywords via API Gateway (PostgreSQL)
+GET http://localhost:8000/api/v1/admin-keywords
+
+### 2f. Delete a Monitored Keyword via API Gateway (PostgreSQL)
+DELETE http://localhost:8000/api/v1/delete-keyword/cancel%20account
+
+### 2g. Direct Phrase Service - Get Keywords
+GET http://localhost:8002/admin-keywords
+
+### 2h. Direct Phrase Service - Extract Keywords in Text
+POST http://localhost:8002/extract-keywords
+Content-Type: application/json
+
+{
+  "text": "I want to cancel my account and demand a refund because of unacceptable service."
+}
+
+### 3a. Analyze Single Sentence Sentiment
+POST http://localhost:8003/analyze-sentiment
+Content-Type: application/json
+
+{
+  "text": "Thank you so much for your quick and wonderful support!"
+}
+
+### 3b. Analyze Batch Sentences Sentiment
+POST http://localhost:8003/analyze-sentiment-batch
+Content-Type: application/json
+
+{
+  "items": [
+    {
+      "isolated_sentence": "This service is terrible and completely unacceptable."
+    },
+    {
+      "isolated_sentence": "I appreciate your help in resolving my billing problem."
+    },
+    {
+      "isolated_sentence": "My customer ID number is 98765."
+    }
+  ]
+}
+
+### 4a. Calculate Score (Standard Defaults)
+POST http://localhost:8004/calculate-score
+Content-Type: application/json
+
+{
+  "emotion": "anger",
+  "confidence": 0.80,
+  "previous_score": -55.0
+}
+
+### 4b. Calculate Score (Positive Domain Step)
+POST http://localhost:8004/calculate-score
+Content-Type: application/json
+
+{
+  "emotion": "gratitude",
+  "confidence": 0.95,
+  "previous_score": 85.0
+}

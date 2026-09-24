@@ -1,0 +1,282 @@
+import os
+import time
+import asyncio
+from pathlib import Path
+from typing import List, Optional, Union, Dict, Any
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+import httpx
+from dotenv import load_dotenv
+from audit_logger import AuditLoggingMiddleware
+
+env_path = Path(__file__).resolve().parent.parent / ".env"
+if env_path.exists():
+    load_dotenv(dotenv_path=env_path)
+else:
+    load_dotenv()
+
+import signal
+from fastapi.responses import JSONResponse
+
+class CriticalError(Exception):
+    pass
+
+app = FastAPI(title="Live Call Sentiment API Gateway")
+
+@app.exception_handler(CriticalError)
+async def critical_error_handler(request: Request, exc: CriticalError):
+    print(f"CRITICAL ERROR: {exc}. Terminating service...")
+    os._exit(1)
+
+app.add_middleware(AuditLoggingMiddleware, service_name="api-gateway")
+
+raw_origins = os.getenv("CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000")
+origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
+if not origins:
+    origins = ["http://localhost:3000"]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+class KeywordItem(BaseModel):
+    keyword: str
+    category: Optional[str] = None
+
+class KeywordPayload(BaseModel):
+    keyword: Optional[str] = None
+    category: Optional[str] = None
+    keywords: Optional[List[Union[str, KeywordItem]]] = None
+
+class MessagePayload(BaseModel):
+    text: str
+    speaker: Optional[str] = "caller"
+    previous_score: Optional[float] = 0.0
+    session_avg_score: Optional[float] = None
+    turn_count: Optional[int] = 1
+    peak_negativity: Optional[float] = None
+    recent_scores: Optional[List[float]] = None
+
+PHRASE_SERVICE_URL = os.getenv("PHRASE_SERVICE_URL", "http://service_phrase:8002/extract-keywords")
+PHRASE_SERVICE_BASE = os.getenv("PHRASE_SERVICE_BASE", PHRASE_SERVICE_URL.rsplit('/', 1)[0] if (PHRASE_SERVICE_URL and '/' in PHRASE_SERVICE_URL) else (PHRASE_SERVICE_URL or "http://service_phrase:8002"))
+SENTIMENT_SERVICE_URL = os.getenv("SENTIMENT_SERVICE_URL", "http://service_sentiment:8003/analyze-sentiment")
+SCORE_SERVICE_URL = os.getenv("SCORE_SERVICE_URL", "http://service_score:8004/calculate-score")
+DOWNSTREAM_TIMEOUT = float(os.getenv("DOWNSTREAM_TIMEOUT", "3.0"))
+
+http_client: Optional[httpx.AsyncClient] = None
+
+
+@app.on_event("startup")
+async def startup_event():
+    global http_client
+    http_client = httpx.AsyncClient(
+        timeout=httpx.Timeout(DOWNSTREAM_TIMEOUT, connect=2.0),
+        limits=httpx.Limits(max_keepalive_connections=20, max_connections=100)
+    )
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global http_client
+    if http_client:
+        await http_client.aclose()
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "service": "api-gateway",
+        "downstream_services": {
+            "phrase_service": PHRASE_SERVICE_URL,
+            "sentiment_service": SENTIMENT_SERVICE_URL,
+            "score_service": SCORE_SERVICE_URL
+        },
+        "cors_origins": origins
+    }
+
+@app.post("/api/v1/add-keyword", status_code=status.HTTP_201_CREATED)
+async def add_keywords(payload: KeywordPayload, request: Request):
+    client = http_client if http_client is not None else httpx.AsyncClient(timeout=DOWNSTREAM_TIMEOUT)
+    target_url = f"{PHRASE_SERVICE_BASE}/add-keyword"
+    headers = {"X-Correlation-ID": getattr(request.state, "correlation_id", "")}
+    try:
+        res = await client.post(target_url, json=payload.dict(), headers=headers)
+        if res.status_code in [200, 201]:
+            return res.json()
+        raise HTTPException(status_code=res.status_code, detail=res.text)
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=503, detail=f"Phrase service unavailable: {str(e)}")
+
+@app.get("/api/v1/admin-keywords")
+async def get_keywords(request: Request):
+    client = http_client if http_client is not None else httpx.AsyncClient(timeout=DOWNSTREAM_TIMEOUT)
+    target_url = f"{PHRASE_SERVICE_BASE}/admin-keywords"
+    headers = {"X-Correlation-ID": getattr(request.state, "correlation_id", "")}
+    try:
+        res = await client.get(target_url, headers=headers)
+        if res.status_code == 200:
+            return res.json()
+        raise HTTPException(status_code=res.status_code, detail=res.text)
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=503, detail=f"Phrase service unavailable: {str(e)}")
+
+@app.delete("/api/v1/delete-keyword/{keyword}")
+async def delete_keyword(keyword: str, request: Request):
+    client = http_client if http_client is not None else httpx.AsyncClient(timeout=DOWNSTREAM_TIMEOUT)
+    target_url = f"{PHRASE_SERVICE_BASE}/delete-keyword/{keyword}"
+    headers = {"X-Correlation-ID": getattr(request.state, "correlation_id", "")}
+    try:
+        res = await client.delete(target_url, headers=headers)
+        if res.status_code == 200:
+            return res.json()
+        raise HTTPException(status_code=res.status_code, detail=res.text)
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=503, detail=f"Phrase service unavailable: {str(e)}")
+
+@app.post("/api/v1/process-text")
+async def process_message(payload: MessagePayload, request: Request):
+    try:
+        start_time = time.perf_counter()
+        client = http_client if http_client is not None else httpx.AsyncClient(timeout=DOWNSTREAM_TIMEOUT)
+        correlation_id = getattr(request.state, "correlation_id", "")
+        downstream_headers = {"X-Correlation-ID": correlation_id}
+        
+        text = payload.text.strip()
+        speaker = payload.speaker if payload.speaker in ["agent", "caller"] else "caller"
+        previous_score = payload.previous_score if payload.previous_score is not None else 0.0
+
+        if not text:
+            return {
+                "status": "success",
+                "processing_time_ms": 0,
+                "services_status": {
+                    "phrase_service": "skipped",
+                    "sentiment_service": "skipped",
+                    "score_service": "skipped"
+                },
+                "detected_issues": []
+            }
+
+        
+        async def fetch_keywords():
+            try:
+                res = await client.post(
+                    PHRASE_SERVICE_URL,
+                    json={"text": text},
+                    headers=downstream_headers,
+                    timeout=DOWNSTREAM_TIMEOUT
+                )
+                if res.status_code == 200:
+                    data = res.json()
+                    return data.get("keywords", data.get("matches", [])), "online"
+                return [], "degraded"
+            except Exception as e:
+                print(f"Warning: Keyword detection service error: {e}")
+                return [], "unavailable"
+
+        async def fetch_sentiment():
+            try:
+                res = await client.post(
+                    SENTIMENT_SERVICE_URL,
+                    json={"text": text},
+                    headers=downstream_headers,
+                    timeout=DOWNSTREAM_TIMEOUT
+                )
+                if res.status_code == 200:
+                    data = res.json()
+                    return {
+                        "emotion": data.get("emotion", "neutral"),
+                        "sentiment_category": data.get("sentiment_category", "neutral"),
+                        "confidence": float(data.get("confidence", 0.0))
+                    }, "online"
+                return {"emotion": "neutral", "sentiment_category": "neutral", "confidence": 0.0}, "degraded"
+            except Exception as e:
+                print(f"Warning: Sentiment analysis service error: {e}")
+                return {"emotion": "neutral", "sentiment_category": "neutral", "confidence": 0.0}, "unavailable"
+
+        (detected_keywords, phrase_status), (sentiment_data, sentiment_status) = await asyncio.gather(
+            fetch_keywords(),
+            fetch_sentiment()
+        )
+
+        emotion = sentiment_data["emotion"]
+        sentiment_category = sentiment_data["sentiment_category"]
+        confidence = sentiment_data["confidence"]
+
+       
+        score_status = "unavailable"
+        score_details = {
+            "emotion": emotion,
+            "confidence": confidence,
+            "emotion_weight": 0.0,
+            "effective_emotion_weight": 0.0,
+            "previous_score": previous_score,
+            "dampening_factor": 1.0,
+            "dampened_raw_score": 0.0,
+            "score": previous_score,
+            "call_health_score": previous_score,
+            "sentiment_trend": "Stable",
+            "peak_negativity": previous_score,
+            "turn_count": payload.turn_count or 1,
+            "session_avg_score": previous_score,
+            "escalation_triggered": previous_score <= -65.0
+        }
+
+        score_req_payload = {
+            "emotion": emotion,
+            "confidence": confidence,
+            "previous_score": previous_score,
+            "speaker": speaker
+        }
+        if payload.session_avg_score is not None:
+            score_req_payload["session_avg_score"] = payload.session_avg_score
+        if payload.turn_count is not None:
+            score_req_payload["turn_count"] = payload.turn_count
+        if payload.peak_negativity is not None:
+            score_req_payload["peak_negativity"] = payload.peak_negativity
+        if payload.recent_scores is not None:
+            score_req_payload["recent_scores"] = payload.recent_scores
+
+        try:
+            score_res = await client.post(
+                SCORE_SERVICE_URL,
+                json=score_req_payload,
+                headers=downstream_headers,
+                timeout=DOWNSTREAM_TIMEOUT
+            )
+            if score_res.status_code == 200:
+                score_details = score_res.json()
+                score_status = "online"
+            else:
+                score_status = "degraded"
+        except Exception as e:
+            print(f"Warning: Score calculation service error: {e}")
+            score_status = "unavailable"
+
+        end_time = time.perf_counter()
+        processing_time_ms = round((end_time - start_time) * 1000, 2)
+
+        calculated_score = score_details.get("score", previous_score)
+        return {
+            "status": "success",
+            "processing_time_ms": processing_time_ms,
+            "services_status": {
+                "phrase_service": phrase_status,
+                "sentiment_service": sentiment_status,
+                "score_service": score_status
+            },
+            "detected_issues": [{
+                "isolated_sentence": text,
+                "detected_keywords": detected_keywords,
+                "emotion": emotion,
+                "confidence": confidence,
+                "sentiment_category": sentiment_category,
+                "live_score": calculated_score
+            }]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Internal Gateway Error: {str(e)}")
